@@ -4,3 +4,4 @@ dart-fss
 python-dotenv
 pulp
 pandas
+python-docx
