@@ -12,6 +12,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from pipeline.db import init_db, get_connection
 from pipeline.filter import INDUSTRY_MAP, stage1_macro_filter
+from pipeline.dart_collector import search_corp_by_name, fetch_corp_realtime
 from agents.analyzer import (
     WEIGHT_PROFILES, compute_numeric_scores, get_weights,
     fetch_business_text, score_rag_single, _save_stage2_results,
@@ -67,7 +68,7 @@ for k, v in [("stage1_count", 0), ("stage2_result", None), ("excluded_count", 0)
              ("weights_used", {}), ("search_result", None), ("excluded_details", []),
              ("last_industry", "전체"), ("report_result", None), ("report_corp_name", ""),
              ("report_doc_type", ""), ("last_product_desc", ""), ("last_category", "기타"),
-             ("profile_saved", False)]:
+             ("profile_saved", False), ("show_manual_form", False), ("manual_corp_name", "")]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -649,6 +650,7 @@ def search_panel_html(sr: dict, profile: dict = None, stage2_df=None, total_db: 
     p_desc_short = (p_desc[:80] + "…") if len(p_desc) > 80 else p_desc
     corp_name  = sr["name"]
     is_error   = sr.get("error", False)
+    _src_tag   = sr.get("source", "DB")
     today      = _date.today().strftime("%Y.%m.%d")
 
     revenue_raw = sr.get("revenue", 0) or 0
@@ -999,6 +1001,12 @@ def search_panel_html(sr: dict, profile: dict = None, stage2_df=None, total_db: 
     # ════════════════════════════════════════════════════════════════════════
     # SECTION 7 — 푸터
     # ════════════════════════════════════════════════════════════════════════
+    _source_label_map = {
+        "DB":         ("데이터 출처: DART 사업보고서 (로컬 DB)", "#ccc"),
+        "DART 실시간": ("데이터 출처: DART 실시간 조회", "#6080c0"),
+        "수동 입력":   ("데이터 출처: 사용자 직접 입력 (재무 데이터 미검증)", "#b06000"),
+    }
+    _src_text, _src_color = _source_label_map.get(_src_tag, ("데이터 출처: DART", "#ccc"))
     if not is_error:
         rank_info = f" · {rank_badge.strip()} · DB {total_db:,}개 중 {pct_label}" if rank_badge else f" · DB {total_db:,}개 중 {pct_label}"
     else:
@@ -1008,7 +1016,7 @@ def search_panel_html(sr: dict, profile: dict = None, stage2_df=None, total_db: 
         f'padding-top:14px;border-top:1.5px solid rgba(0,0,0,0.07);">'
         f'<span style="color:#ccc;font-size:0.83rem;">분석일: {today}</span>'
         f'<span style="color:#ddd;">·</span>'
-        f'<span style="color:#ccc;font-size:0.83rem;">데이터 출처: DART, 사업보고서, 기업 공시</span>'
+        f'<span style="color:{_src_color};font-size:0.83rem;">{_src_text}</span>'
         f'{rank_info}'
         f'</div>'
     )
@@ -1240,7 +1248,9 @@ with tab_dashboard:
                         merged["debt_score"] * weights["debt_score"] +
                         merged["rag_score"]  * weights["rag_score"]
                     ) * 10
-                    result = run_stage3(merged, am_slots=top_n, top_n=top_n)
+                    _n_sectors = merged["industry"].fillna("00").astype(str).str[:2].nunique()
+                    _sector_lim = max(4, -(-top_n // max(_n_sectors, 1)))
+                    result = run_stage3(merged, am_slots=top_n, top_n=top_n, sector_limit=_sector_lim)
                     _save_stage2_results(result, _product_desc, _category, _DB_YEAR)
                     st.session_state.stage2_result = result
                     st.session_state.search_result = None
@@ -1249,6 +1259,69 @@ with tab_dashboard:
                     st.rerun()
 
     # ── 기업 분석 버튼 핸들러 ─────────────────────────────────────────────────
+    def _run_search_analysis(target: pd.Series, product_desc: str, category: str, source_label: str = ""):
+        """target Series로 RAG 분석 실행 후 search_result 저장."""
+        rag = None
+        try:
+            with st.spinner(f"{target['corp_name']} 분석 중..."):
+                biz = fetch_business_text(target["corp_code"], year=_DB_YEAR)
+                rag = score_rag_single(
+                    target["corp_name"], biz, product_desc, category,
+                    industry_code=str(target.get("industry", "")),
+                    revenue=int(target.get("revenue") or 0),
+                    rd_expense=int(target["rd_expense"]) if (target.get("rd_expense") and not pd.isna(target["rd_expense"])) else None,
+                )
+        except RuntimeError as e:
+            if "CREDIT_EXHAUSTED" in str(e):
+                st.error("Anthropic API 크레딧이 부족합니다. [console.anthropic.com](https://console.anthropic.com) 에서 충전 후 재시도하세요.")
+                st.stop()
+            st.session_state.search_result = {
+                "error": True, "name": target["corp_name"],
+                "reason": f"분석 오류: {e}", "source": source_label,
+                "revenue": int(target.get("revenue") or 0),
+                "debt_ratio": float(target.get("debt_ratio") or 0),
+                "rag_detail": "{}",
+            }
+            return
+        except Exception as e:
+            st.session_state.search_result = {
+                "error": True, "name": target["corp_name"],
+                "reason": f"분석 중 오류: {e}", "source": source_label,
+                "revenue": int(target.get("revenue") or 0),
+                "debt_ratio": float(target.get("debt_ratio") or 0),
+                "rag_detail": "{}",
+            }
+            return
+        if rag is None:
+            return
+        if not rag.get("is_valid", True):
+            st.session_state.search_result = {
+                "error": True, "name": target["corp_name"],
+                "reason": rag.get("invalid_reason", "업종 부적합"), "source": source_label,
+                "revenue": int(target.get("revenue") or 0),
+                "debt_ratio": float(target.get("debt_ratio") or 0),
+                "rag_detail": json.dumps(rag, ensure_ascii=False),
+            }
+        else:
+            rag_score = sum(v["score"] for v in rag.values()
+                            if isinstance(v, dict) and "score" in v) / len(RAG_LABEL)
+            w2    = WEIGHT_PROFILES.get(category) or {"rd_score": 0.33, "debt_score": 0.33, "rag_score": 0.34}
+            rd_s  = min(((target.get("rd_expense") or 0) / (target["revenue"] or 1)) * 500, 10.0)
+            dbt_s = max(0.0, 10.0 - (target.get("debt_ratio") or 100) / 20)
+            total = (rd_s * w2["rd_score"] + dbt_s * w2["debt_score"] + rag_score * w2["rag_score"]) * 10
+            st.session_state.search_result = {
+                "error": False, "name": target["corp_name"],
+                "total": total, "rd": rd_s, "debt": dbt_s, "rag": rag_score,
+                "industry":   str(target.get("industry", "-")),
+                "market":     str(target.get("market_type", "-")),
+                "revenue":    int(target.get("revenue") or 0),
+                "employees":  int(target.get("employees") or 0),
+                "debt_ratio": float(target.get("debt_ratio") or 0),
+                "corp_code":  str(target["corp_code"]),
+                "source":     source_label,
+                "rag_detail": json.dumps(rag, ensure_ascii=False),
+            }
+
     if search_btn:
         if not st.session_state.profile_saved:
             st.warning("먼저 '내 기업 프로필'을 작성하고 [프로필 등록]을 눌러주세요.")
@@ -1263,6 +1336,10 @@ with tab_dashboard:
             st.session_state.excluded_count   = 0
             st.session_state.weights_used     = {}
             st.session_state.report_result    = None
+            st.session_state.show_manual_form = False
+            st.session_state.manual_corp_name = corp_name_input.strip()
+
+            # 1) 로컬 DB 검색
             try:
                 conn  = get_connection()
                 cur   = conn.execute("SELECT * FROM companies WHERE corp_name LIKE ? AND year=?",
@@ -1272,67 +1349,131 @@ with tab_dashboard:
                 conn.close()
             except Exception:
                 rows, cols = [], []
-            if not rows:
-                st.warning(f"'{corp_name_input}' DB에서 찾을 수 없습니다.")
-            else:
+
+            if rows:
                 target = pd.DataFrame(rows, columns=cols).iloc[0]
-                rag = None
+                _run_search_analysis(target, _s_product_desc, _s_category, source_label="DB")
+                st.rerun()
+            else:
+                # 2) DART API로 corp_code 조회 → DB 재검색 (한글↔영문명 불일치 해결)
+                with st.spinner(f"'{corp_name_input.strip()}' DART에서 법인 코드 검색 중..."):
+                    dart_hits = search_corp_by_name(corp_name_input.strip())
+                if dart_hits:
+                    # 2a) 찾은 corp_code들로 DB 재검색
+                    dart_codes = [h["corp_code"] for h in dart_hits]
+                    placeholders = ",".join("?" * len(dart_codes))
+                    try:
+                        conn2 = get_connection()
+                        cur2  = conn2.execute(
+                            f"SELECT * FROM companies WHERE corp_code IN ({placeholders}) AND year=?",
+                            dart_codes + [_DB_YEAR],
+                        )
+                        rows2 = cur2.fetchall()
+                        cols2 = [d[0] for d in cur2.description]
+                        conn2.close()
+                    except Exception:
+                        rows2, cols2 = [], []
+                    if rows2:
+                        target = pd.DataFrame(rows2, columns=cols2).iloc[0]
+                        _run_search_analysis(target, _s_product_desc, _s_category, source_label="DB")
+                        st.rerun()
+                    else:
+                        # 2b) DB에도 없으면 실시간 수집
+                        dart_row = dart_hits[0]
+                        with st.spinner(f"DART 데이터 실시간 수집 중 — {dart_row['corp_name']}..."):
+                            rt = fetch_corp_realtime(dart_row["corp_code"], dart_row["corp_name"], year=_DB_YEAR - 1)
+                        if rt:
+                            target = pd.Series(rt)
+                            _run_search_analysis(target, _s_product_desc, _s_category, source_label="DART 실시간")
+                            st.rerun()
+                        else:
+                            st.session_state.show_manual_form = True
+                            st.rerun()
+                else:
+                    # 3) 수동 입력 폼으로 안내 (DART 공시 없는 기업)
+                    st.session_state.show_manual_form = True
+                    st.rerun()
+
+    # ── 수동 입력 폼 (DB·DART 모두 없을 때) ───────────────────────────────────
+    if st.session_state.show_manual_form:
+        _mc = st.session_state.manual_corp_name
+        st.markdown(
+            f'<div style="background:rgba(232,48,90,0.04);border:1.5px solid rgba(232,48,90,0.18);'
+            f'border-radius:14px;padding:16px 20px;margin-bottom:12px;">'
+            f'<p style="color:#C4183C;font-weight:700;font-size:1.0rem;margin:0 0 4px 0;">'
+            f'<b>"{_mc}"</b> — DART 공시 데이터 없음</p>'
+            f'<p style="color:#9a5060;font-size:0.92rem;margin:0;">비상장·소규모 기업이거나 공시 미제출 기업입니다. '
+            f'기업 정보를 직접 입력하면 RAG 분석을 진행할 수 있습니다.</p>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        with st.form("manual_form"):
+            mf1, mf2, mf3 = st.columns(3)
+            with mf1:
+                m_revenue_억 = st.number_input("매출액 (억 원)", min_value=0, value=500, step=100)
+                m_industry   = st.selectbox("업종", list(INDUSTRY_MAP.keys()), index=0)
+            with mf2:
+                m_employees  = st.number_input("임직원 수 (명)", min_value=0, value=100, step=10)
+                m_debt_ratio = st.number_input("부채비율 (%)", min_value=0, value=100, step=10)
+            with mf3:
+                m_rd_억      = st.number_input("R&D 투자액 (억 원, 없으면 0)", min_value=0, value=0, step=10)
+                m_market     = st.selectbox("시장 구분", ["비상장", "KOSPI", "KOSDAQ"])
+            m_biz_desc = st.text_area(
+                "기업 설명 (사업 내용, 주요 고객, 도입 솔루션 등 알고 있는 정보)",
+                height=80,
+                placeholder="예: 식품 제조 기업으로 스마트팩토리 도입을 추진 중이며, ERP 시스템을 운영하고 있음.",
+            )
+            manual_submit = st.form_submit_button("이 정보로 분석 시작", use_container_width=True)
+
+        if manual_submit:
+            if not st.session_state.profile_saved:
+                st.warning("먼저 프로필을 등록해주세요.")
+            else:
+                _s_product_desc = st.session_state.last_product_desc
+                _s_category     = st.session_state.last_category
+                _m_revenue      = int(m_revenue_억 * 1_0000_0000)
+                _m_rd           = int(m_rd_억 * 1_0000_0000)
+                _ind_codes      = INDUSTRY_MAP.get(m_industry, [])
+                _ind_code       = _ind_codes[0] if _ind_codes else "00"
                 try:
-                    with st.spinner(f"{target['corp_name']} 분석 중..."):
-                        biz = fetch_business_text(target["corp_code"], year=_DB_YEAR)
+                    with st.spinner(f"{_mc} 분석 중 (수동 입력)..."):
                         rag = score_rag_single(
-                            target["corp_name"], biz, _s_product_desc, _s_category,
-                            industry_code=str(target.get("industry", "")),
-                            revenue=int(target.get("revenue") or 0),
-                            rd_expense=int(target["rd_expense"]) if (target.get("rd_expense") and not pd.isna(target["rd_expense"])) else None,
+                            _mc, m_biz_desc, _s_product_desc, _s_category,
+                            industry_code=_ind_code,
+                            revenue=_m_revenue,
+                            rd_expense=_m_rd or None,
                         )
                 except RuntimeError as e:
                     if "CREDIT_EXHAUSTED" in str(e):
-                        st.error("Anthropic API 크레딧이 부족합니다. [console.anthropic.com](https://console.anthropic.com) 에서 충전 후 재시도하세요.")
+                        st.error("Anthropic API 크레딧이 부족합니다.")
                         st.stop()
-                    st.session_state.search_result = {
-                        "error": True, "name": target["corp_name"],
-                        "reason": f"분석 오류: {e}",
-                        "revenue": int(target.get("revenue") or 0),
-                        "debt_ratio": float(target.get("debt_ratio") or 0),
-                        "rag_detail": "{}",
-                    }
+                    st.error(f"분석 오류: {e}")
+                    rag = None
                 except Exception as e:
+                    st.error(f"분석 오류: {e}")
+                    rag = None
+
+                if rag:
+                    rag_score = sum(v["score"] for v in rag.values()
+                                    if isinstance(v, dict) and "score" in v) / len(RAG_LABEL)
+                    w2    = WEIGHT_PROFILES.get(_s_category) or {"rd_score": 0.33, "debt_score": 0.33, "rag_score": 0.34}
+                    rd_s  = min((_m_rd / (_m_revenue or 1)) * 500, 10.0)
+                    dbt_s = max(0.0, 10.0 - m_debt_ratio / 20)
+                    total = (rd_s * w2["rd_score"] + dbt_s * w2["debt_score"] + rag_score * w2["rag_score"]) * 10
                     st.session_state.search_result = {
-                        "error": True, "name": target["corp_name"],
-                        "reason": f"분석 중 오류가 발생했습니다: {e}",
-                        "revenue": int(target.get("revenue") or 0),
-                        "debt_ratio": float(target.get("debt_ratio") or 0),
-                        "rag_detail": "{}",
+                        "error": False, "name": _mc,
+                        "total": total, "rd": rd_s, "debt": dbt_s, "rag": rag_score,
+                        "industry":   _ind_code,
+                        "market":     m_market,
+                        "revenue":    _m_revenue,
+                        "employees":  int(m_employees),
+                        "debt_ratio": float(m_debt_ratio),
+                        "corp_code":  "",
+                        "source":     "수동 입력",
+                        "rag_detail": json.dumps(rag, ensure_ascii=False),
                     }
-                if rag is not None and st.session_state.search_result is None:
-                    if not rag.get("is_valid", True):
-                        st.session_state.search_result = {
-                            "error": True, "name": target["corp_name"],
-                            "reason": rag.get("invalid_reason", "업종 부적합"),
-                            "revenue": int(target.get("revenue") or 0),
-                            "debt_ratio": float(target.get("debt_ratio") or 0),
-                            "rag_detail": json.dumps(rag, ensure_ascii=False),
-                        }
-                    else:
-                        rag_score = sum(v["score"] for v in rag.values()
-                                        if isinstance(v, dict) and "score" in v) / len(RAG_LABEL)
-                        w2    = WEIGHT_PROFILES.get(_s_category) or {"rd_score": 0.33, "debt_score": 0.33, "rag_score": 0.34}
-                        rd_s  = min(((target.get("rd_expense") or 0) / (target["revenue"] or 1)) * 500, 10.0)
-                        dbt_s = max(0.0, 10.0 - (target.get("debt_ratio") or 100) / 20)
-                        total = (rd_s * w2["rd_score"] + dbt_s * w2["debt_score"] + rag_score * w2["rag_score"]) * 10
-                        st.session_state.search_result = {
-                            "error": False, "name": target["corp_name"],
-                            "total": total, "rd": rd_s, "debt": dbt_s, "rag": rag_score,
-                            "industry":   str(target.get("industry", "-")),
-                            "market":     str(target.get("market_type", "-")),
-                            "revenue":    int(target.get("revenue") or 0),
-                            "employees":  int(target.get("employees") or 0),
-                            "debt_ratio": float(target.get("debt_ratio") or 0),
-                            "corp_code":  str(target["corp_code"]),
-                            "rag_detail": json.dumps(rag, ensure_ascii=False),
-                        }
-                st.rerun()
+                    st.session_state.show_manual_form = False
+                    st.rerun()
 
     # ── 결과 렌더링 ──
     result_df = st.session_state.stage2_result

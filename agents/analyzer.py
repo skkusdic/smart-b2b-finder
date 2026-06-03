@@ -118,13 +118,16 @@ def get_weights(product_category: str, product_description: str) -> dict:
 # ── DART 사업보고서 텍스트 수집 ───────────────────────────────────────────────
 
 def _get_rcept_no(corp_code: str, year: int = 2025) -> str | None:
-    """corp_code로 해당 연도 사업보고서 접수번호 조회."""
+    """corp_code로 해당 회계연도 사업보고서 접수번호 조회.
+    사업보고서(11011)는 회계연도 다음 해 1~6월에 제출되므로 year+1 범위를 검색.
+    """
+    submit_year = year + 1
     params = {
         "crtfc_key": DART_API_KEY,
         "corp_code": corp_code,
         "pblntf_ty": "A",
-        "bgn_de": f"{year}0101",
-        "end_de": f"{year}1231",
+        "bgn_de": f"{submit_year}0101",
+        "end_de": f"{submit_year}0630",
         "page_count": 10,
     }
     data = requests.get(f"{DART_BASE}/list.json", params=params, timeout=10).json()

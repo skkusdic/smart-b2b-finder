@@ -102,6 +102,50 @@ def fetch_company_info(corp_code: str) -> dict:
     }
 
 
+def search_corp_by_name(corp_name: str) -> list[dict]:
+    """기업명으로 DART 공시 목록에서 corp_code 검색 (실시간).
+    DART list.json은 bgn_de/end_de 필수 — 최근 2년 범위로 고정.
+    """
+    data = _get("list.json", {
+        "corp_name": corp_name,
+        "pblntf_ty": "A",
+        "bgn_de": "20240101",
+        "end_de": "20261231",
+        "page_count": 10,
+        "page_no": 1,
+    })
+    if data.get("status") != "000":
+        return []
+    seen, result = set(), []
+    for item in data.get("list", []):
+        cc = item.get("corp_code")
+        if cc and cc not in seen:
+            seen.add(cc)
+            result.append({"corp_code": cc, "corp_name": item.get("corp_name", "")})
+    return result
+
+
+def fetch_corp_realtime(corp_code: str, corp_name: str, year: int = 2024) -> dict | None:
+    """DART API로 기업 재무·기본 정보를 실시간 수집해 companies 행 구조로 반환."""
+    fin = fetch_financials(corp_code, year=year)
+    if not fin:
+        return None
+    info = fetch_company_info(corp_code)
+    detail = fetch_detailed_financials(corp_code, year=year)
+    return {
+        "corp_code":   corp_code,
+        "corp_name":   corp_name,
+        "market_type": info.get("market_type", "ETC"),
+        "industry":    info.get("industry", ""),
+        "revenue":     fin.get("revenue"),
+        "rd_expense":  detail.get("rd_expense") or fin.get("rd_expense"),
+        "debt_ratio":  detail.get("debt_ratio"),
+        "employees":   info.get("employees"),
+        "year":        year,
+        "passed_filter": 0,
+    }
+
+
 def fetch_bizr_no(corp_code: str) -> str:
     """corp_code → 사업자등록번호 (KIPRIS 연동용)."""
     data = _get("company.json", {"corp_code": corp_code})
